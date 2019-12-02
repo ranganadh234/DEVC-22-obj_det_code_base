@@ -132,10 +132,33 @@ def main():
     #log.info("Starting inference in async mode, {} requests in parallel...".format(args.number_infer_requests))
     job_id = str(os.environ['PBS_JOBID'])
     result_file = open(os.path.join(args.output_dir, 'output_'+job_id+'.txt'), "w")
+    pre_infer_file = os.path.join(args.output_dir, 'pre_progress_'+job_id+'.txt')
     infer_file = os.path.join(args.output_dir, 'i_progress_'+job_id+'.txt')
-
+    processed_vid = '/tmp/processed_vid.bin'
+    
     cap = cv2.VideoCapture(input_stream)
     video_len = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_len < args.number_infer_requests:
+        args.number_infer_requests = video_len
+    width = int(cap.get(3))
+    height = int(cap.get(4))
+    CHUNKSIZE = n*c*w*h
+    id_ = 0
+    with open(processed_vid, 'w+b') as f:
+        time_start = time.time()
+        while cap.isOpened():
+            ret, next_frame = cap.read()
+            if not ret:
+                break
+            in_frame = cv2.resize(next_frame, (w, h))
+            in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
+            in_frame = in_frame.reshape((n, c, h, w))
+            bin_frame = bytearray(in_frame) 
+            f.write(bin_frame)
+            id_ += 1
+            if id_%10 == 0: 
+                progressUpdate(pre_infer_file, time.time()-time_start, id_, video_len) 
+    cap.release()
     cur_request_id = 0
     next_request_id = 1
     frame_count = 0
@@ -148,73 +171,44 @@ def main():
     print("To switch between sync/async modes, press TAB key in the output window")
     
     infer_time_start = time.time()
-    while cap.isOpened():
-        if is_async_mode:
-            ret, next_frame = cap.read()
-        else:
-            ret, frame = cap.read()
-        if not ret:
-            break
-        initial_w = cap.get(3)
-        initial_h = cap.get(4)
-        # Main sync point:
-        # in the truly Async mode we start the NEXT infer request, while waiting for the CURRENT to complete
-        # in the regular mode we start the CURRENT request and immediately wait for it's completion
-        inf_start = time.time()
-        #if is_async_mode:
-        in_frame = cv2.resize(next_frame, (w, h))
-        in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
-        in_frame = in_frame.reshape((n, c, h, w))
-        feed_dict[input_blob] = in_frame
-        exec_net.start_async(request_id=cur_request_id, inputs=feed_dict)
-        '''else:
-            in_frame = cv2.resize(frame, (w, h))
-            in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
-            in_frame = in_frame.reshape((n, c, h, w))
-            feed_dict[input_blob] = in_frame
-            exec_net.start_async(request_id=cur_request_id, inputs=feed_dict)'''
-        if is_async_mode:
-            if next_request_id >= 0:
-                if exec_net.requests[next_request_id].wait(-1) == 0:
-                    inf_end = time.time()
-                    det_time = inf_end - inf_start
-                    res = exec_net.requests[next_request_id].outputs[out_blob]
-                    processBoxes(frame_count, res, labels_map, args.prob_threshold, initial_w, initial_h, result_file)
-                    frame_count += 1
-        else:
-            if exec_net.requests[cur_request_id].wait(-1) == 0:
-                res = exec_net.requests[cur_request_id].outputs[out_blob]
-                processBoxes(frame_count, res, labels_map, args.prob_threshold, width, height, result_file)
-                frame_count+=1
-        if frame_count % 10 == 0: 
-            progressUpdate(infer_file, time.time()-infer_time_start, frame_count+1, video_len+1) 
-            # Parse detection results of the current request
-            #res = exec_net.requests[cur_request_id].outputs[out_blob]
-            #for obj in res[0][0]:
-                # Draw only objects when probability more than specified threshold
-             #   if obj[2] > args.prob_threshold:
-              #      dims = "{frame_id} {xmin} {ymin} {xmax} {ymax} {class_id} {est} {time} \n".format(frame_id=frame_count, xmin=int(obj[3]                     * initial_w), ymin=int(obj[4] * initial_h), xmax=int(obj[5] * initial_w), ymax=int(obj[6] * initial_h),                                     class_id=int(obj[1]), est=round(obj[2]*100, 1), time='N/A')
+    with open(processed_vid, "rb") as data:
+        while frame_count < video_len:
+            inf_start = time.time()
+            byte = data.read(CHUNKSIZE)
+            if not byte == b"":
+                deserialized_bytes = np.frombuffer(byte, dtype=np.uint8)
+                in_frame = np.reshape(deserialized_bytes, newshape=(n, c, h, w))
+                #exec_net.start_async(request_id=current_inference, inputs={input_blob: in_frame})
+                exec_net.start_async(request_id=cur_request_id, inputs={input_blob: in_frame})
+            if is_async_mode:
+                if next_request_id >= 0:
+                    if exec_net.requests[next_request_id].wait(-1) == 0:
+                        inf_end = time.time()
+                        det_time = inf_end - inf_start
+                        res = exec_net.requests[next_request_id].outputs[out_blob]
+                        processBoxes(frame_count, res, labels_map, args.prob_threshold, width, height, result_file)
+                        frame_count += 1
+            else:
+                if exec_net.requests[cur_request_id].wait(-1) == 0:
+                    res = exec_net.requests[cur_request_id].outputs[out_blob]
+                    processBoxes(frame_count, res, labels_map, args.prob_threshold, width, height, result_file)
+                    frame_count+=1
+            if frame_count % 10 == 0: 
+                progressUpdate(infer_file, time.time()-infer_time_start, frame_count+1, video_len+1) 
 
-                    #result_file.write(dims)
-
-        if is_async_mode:
-            cur_request_id+=1
-            if cur_request_id >= args.number_infer_requests:
-                cur_request_id = 0
-            next_request_id += 1
-            if next_request_id >= args.number_infer_requests:
-                next_request_id = 0
-            #cur_request_id, next_request_id = next_request_id, cur_request_id
-            #frame = next_frame
-
-
-    #cv2.destroyAllWindows()
-    # End while loop
-    total_time = time.time() - infer_time_start
-    with open(os.path.join(args.output_dir, 'stats_{}.txt'.format(job_id)), 'w') as f:
-        f.write('{:.3g} \n'.format(total_time))
-        f.write('{} \n'.format(frame_count))
-    result_file.close()
+            if is_async_mode:
+                cur_request_id+=1
+                if cur_request_id >= args.number_infer_requests:
+                    cur_request_id = 0
+                next_request_id += 1
+                if next_request_id >= args.number_infer_requests:
+                    next_request_id = 0
+        # End while loop
+        total_time = time.time() - infer_time_start
+        with open(os.path.join(args.output_dir, 'stats_{}.txt'.format(job_id)), 'w') as f:
+            f.write('{:.3g} \n'.format(total_time))
+            f.write('{} \n'.format(frame_count))
+        result_file.close()
 
 if __name__ == '__main__':
     sys.exit(main() or 0)
